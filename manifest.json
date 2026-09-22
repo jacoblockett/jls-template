@@ -1,0 +1,10 @@
+{
+  "name": "template",
+  "version": "0.0.0",
+  "min_installer": "0.4.0",
+  "description": "Canonical scaffold for portable JLS skills",
+  "skill_files": [
+    "SKILL.md"
+  ],
+  "instruction_fragment": "AGENTS.md"
+}

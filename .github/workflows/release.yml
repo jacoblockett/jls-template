@@ -1,0 +1,268 @@
+name: Release
+
+on:
+  schedule:
+    - cron: '0 23 * * *'
+      timezone: 'America/New_York'
+  workflow_dispatch:
+    inputs:
+      action:
+        description: What to run
+        required: true
+        default: package
+        type: choice
+        options:
+          - package
+          - nightly
+          - stable
+      version:
+        description: Stable semantic version (for example 0.1.0)
+        required: false
+        type: string
+      force:
+        description: Force a nightly even when no package-relevant source changed
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.repository }}-release
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      should_package: ${{ steps.mode.outputs.should_package }}
+      release_tag: ${{ steps.mode.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve mode
+        id: mode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mode=nightly
+          if [[ '${{ github.event_name }}' == 'workflow_dispatch' ]]; then
+            mode='${{ inputs.action }}'
+          fi
+          if [[ '${{ github.ref }}' != 'refs/heads/main' ]]; then
+            echo 'Release automation may only run from main.' >&2
+            exit 1
+          fi
+
+          name="$(jq -er '.name' manifest.json)"
+          version="$(jq -er '.version' manifest.json)"
+          min_installer="$(jq -er '.min_installer' manifest.json)"
+
+          [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]] || { echo "Invalid skill name: $name" >&2; exit 1; }
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Manifest version must be plain semver: $version" >&2; exit 1; }
+          [[ "$min_installer" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "min_installer must be plain semver: $min_installer" >&2; exit 1; }
+
+          should_package=true
+          release_tag=dev
+
+          if [[ "$mode" == nightly ]]; then
+            force='${{ github.event_name == 'workflow_dispatch' && inputs.force || false }}'
+            git fetch origin --tags --force
+            if [[ "$force" != true ]] && git rev-parse -q --verify refs/tags/nightly >/dev/null; then
+              mapfile -t declared < <(
+                jq -r '
+                  [
+                    .skill_files[]?,
+                    .instruction_fragment?,
+                    ((.harness_resources? // {}) | to_entries[]?.value | to_entries[]?.value[]?)
+                  ]
+                  | .[]
+                  | select(type == "string" and length > 0)
+                ' manifest.json
+              )
+              package_paths=(
+                .github/workflows/release.yml
+                .github/workflows/version-check.yml
+                .github/workflows/test-build-trigger.yml
+                manifest.json
+                LICENSE
+                "${declared[@]}"
+              )
+              mapfile -t files < <(git diff --name-only nightly..HEAD -- "${package_paths[@]}")
+              if (( ${#files[@]} == 0 )); then should_package=false; fi
+            fi
+            release_tag=nightly
+          elif [[ "$mode" == stable ]]; then
+            requested_version='${{ inputs.version }}'
+            if [[ ! "$requested_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo 'Stable releases require an explicit plain-semver version input.' >&2
+              exit 1
+            fi
+            if [[ "$requested_version" != "$version" ]]; then
+              echo "Requested stable version $requested_version does not match manifest.json version $version." >&2
+              exit 1
+            fi
+            release_tag="v$requested_version"
+            git fetch origin --tags --force
+            if git rev-parse -q --verify "refs/tags/$release_tag" >/dev/null; then
+              echo "Tag $release_tag already exists." >&2
+              exit 1
+            fi
+          elif [[ "$mode" != package ]]; then
+            echo "Unknown release mode: $mode" >&2
+            exit 1
+          fi
+
+          # The canonical template is testable but must never publish itself.
+          if [[ "$name" == template && "$mode" != package ]]; then
+            should_package=false
+            echo 'Template repository does not publish nightly or stable releases.'
+          fi
+
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "should_package=$should_package" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: No package
+        if: steps.mode.outputs.should_package != 'true'
+        run: echo 'Nothing to package or publish.'
+
+  package:
+    needs: prepare
+    if: needs.prepare.outputs.should_package == 'true'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate and package portable skill
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          name="$(jq -er '.name' manifest.json)"
+          version="$(jq -er '.version' manifest.json)"
+          min_installer="$(jq -er '.min_installer' manifest.json)"
+
+          [[ "$name" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          [[ "$min_installer" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          jq -e '.skill_files | type == "array" and length > 0 and all(.[]; type == "string" and length > 0)' manifest.json >/dev/null
+          jq -e 'has("runtime") | not' manifest.json >/dev/null
+          jq -e 'has("runtime_artifacts") | not' manifest.json >/dev/null
+          jq -e 'has("runtime_cli") | not' manifest.json >/dev/null
+
+          mapfile -t declared < <(
+            jq -r '
+              [
+                .skill_files[]?,
+                .instruction_fragment?,
+                ((.harness_resources? // {}) | to_entries[]?.value | to_entries[]?.value[]?)
+              ]
+              | .[]
+              | select(type == "string" and length > 0)
+            ' manifest.json
+          )
+
+          for path in "${declared[@]}"; do
+            test -f "$path"
+          done
+
+          rm -rf build
+          stage="$PWD/build/package"
+          mkdir -p "$stage" "$PWD/build/release"
+          cp manifest.json LICENSE "$stage/"
+
+          for path in "${declared[@]}"; do
+            mkdir -p "$stage/$(dirname "$path")"
+            cp "$path" "$stage/$path"
+          done
+
+          archive="$PWD/build/release/$name.zip"
+          (
+            cd "$stage"
+            zip -q -r "$archive" .
+          )
+
+          sha256="$(sha256sum "$archive" | cut -d' ' -f1)"
+          url="https://github.com/$GH_REPO/releases/download/$RELEASE_TAG/$name.zip"
+          jq \
+            --arg url "$url" \
+            --arg sha256 "$sha256" \
+            '{name, version, min_installer, description, artifacts: {portable: {url: $url, sha256: $sha256}}}
+             + (if has("dependencies") then {dependencies} else {} end)' \
+            manifest.json > build/release/manifest.json
+
+          test -s "$archive"
+          jq -e '.artifacts.portable.url and .artifacts.portable.sha256' build/release/manifest.json >/dev/null
+          jq -e --slurp '
+            .[0].description == .[1].description
+            and (.[0].dependencies // null) == (.[1].dependencies // null)
+          ' build/release/manifest.json manifest.json >/dev/null
+
+      - name: Upload verified release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          if-no-files-found: error
+          retention-days: 14
+          path: build/release/*
+
+  publish:
+    needs: [prepare, package]
+    if: needs.prepare.outputs.should_package == 'true' && needs.prepare.outputs.mode != 'package'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-bundle
+          path: build/release
+
+      - name: Publish verified portable release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_MODE: ${{ needs.prepare.outputs.mode }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          name="$(jq -er '.name' manifest.json)"
+          mapfile -t assets < <(find build/release -maxdepth 1 -type f -print | sort)
+          if (( ${#assets[@]} == 0 )); then
+            echo 'Verified release bundle is empty.' >&2
+            exit 1
+          fi
+
+          if [[ "$RELEASE_MODE" == nightly ]]; then
+            if gh release view "$RELEASE_TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+              gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" --clobber
+              mapfile -t existing < <(gh release view "$RELEASE_TAG" --repo "$GH_REPO" --json assets --jq '.assets[].name')
+              for asset_name in "${existing[@]}"; do
+                if [[ ! -f "build/release/$asset_name" ]]; then
+                  gh release delete-asset "$RELEASE_TAG" "$asset_name" --repo "$GH_REPO" -y
+                fi
+              done
+            else
+              gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" --title 'Nightly' --notes "Rolling $name package from main." --prerelease --target "$GITHUB_SHA"
+            fi
+            git config user.name 'github-actions[bot]'
+            git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+            git tag -f nightly "$GITHUB_SHA"
+            git push origin refs/tags/nightly --force
+          else
+            min_installer="$(jq -er '.min_installer' manifest.json)"
+            gh release create "$RELEASE_TAG" "${assets[@]}" --repo "$GH_REPO" --title "$RELEASE_TAG" --notes "Requires JLS installer $min_installer or newer." --generate-notes --target "$GITHUB_SHA"
+          fi
