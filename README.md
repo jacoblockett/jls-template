@@ -8,7 +8,7 @@ Skills built from Template support OpenAI Codex and Claude Code.
 
 Copy this repository for a new portable skill, then replace the template metadata and skill content. Keep the shared workflow structure intact unless the skill's packaging or runtime requirements genuinely require a different build path.
 
-The workflow scaffold separates reusable Build, manual Test, scheduled Nightly, manual Release, and automatic Test Trigger concerns. Release derives major/minor/patch versions from the current stable release or can replace the current release; source `manifest.json` does not track a version. Creating an ephemeral `jls-test/**` branch dispatches Test and the trigger workflow deletes that branch automatically.
+The workflow scaffold separates reusable Build, manual Test, scheduled Nightly, manual Release, and automatic Test Trigger concerns. Release derives major/minor/patch versions from the current stable release or can replace the current release; source `manifest.json` does not track a version. The canonical Template repository itself refuses Nightly/Release publication, while copied skills activate those workflows after replacing the template name. Creating an ephemeral `jls-test/**` branch dispatches Test and the trigger workflow deletes that branch automatically.
 
 ## Install
 
