@@ -8,7 +8,7 @@ Skills built from Template support OpenAI Codex and Claude Code.
 
 Copy this repository for a new portable skill, then replace the template metadata and skill content. Keep the shared workflow structure intact unless the skill's packaging or runtime requirements genuinely require a different build path.
 
-Stable releases are triggered only when the version in `manifest.json` increases. Creating an ephemeral `jls-test/**` branch triggers a non-release package build and the trigger workflow deletes that branch automatically.
+Stable releases are manually triggered from Actions with the release version supplied to the workflow; the source `manifest.json` does not track a version. Creating an ephemeral `jls-test/**` branch triggers a non-release package build and the trigger workflow deletes that branch automatically.
 
 ## Install
 
